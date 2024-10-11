@@ -17,23 +17,23 @@ use itertools::Itertools;
 
 use check_release::run_check_release;
 use rustdoc_gen::CrateDataForRustdoc;
+use serde::Serialize;
 use trustfall_rustdoc::{load_rustdoc, VersionedCrate};
 
 use rustdoc_cmd::RustdocCommand;
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::Instant;
 
-pub use config::GlobalConfig;
+pub use config::{FeatureFlag, GlobalConfig};
 pub use query::{
     ActualSemverUpdate, LintLevel, OverrideMap, OverrideStack, QueryOverride, RequiredSemverUpdate,
-    SemverQuery,
+    SemverQuery, Witness,
 };
 
 /// Test a release for semver violations.
 #[non_exhaustive]
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Serialize)]
 pub struct Check {
     /// Which packages to analyze.
     scope: Scope,
@@ -44,6 +44,8 @@ pub struct Check {
     baseline_feature_config: rustdoc_gen::FeatureConfig,
     /// Which `--target` to use, if unset pass no flag
     build_target: Option<String>,
+    /// Options for generating [witnesses](Witness).
+    witness_generation: WitnessGeneration,
 }
 
 /// The kind of release we're making.
@@ -51,7 +53,7 @@ pub struct Check {
 /// Affects which lints are executed.
 /// Non-exhaustive in case we want to add "pre-release" as an option in the future.
 #[non_exhaustive]
-#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum ReleaseType {
     Major,
     Minor,
@@ -59,7 +61,7 @@ pub enum ReleaseType {
 }
 
 #[non_exhaustive]
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Serialize)]
 pub struct Rustdoc {
     source: RustdocSource,
 }
@@ -109,7 +111,7 @@ impl Rustdoc {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Serialize)]
 enum RustdocSource {
     /// Path to the Rustdoc json file.
     /// Use this option when you have already generated the rustdoc file.
@@ -127,12 +129,12 @@ enum RustdocSource {
 }
 
 /// Which packages to analyze.
-#[derive(Default, Debug, PartialEq, Eq)]
+#[derive(Default, Debug, PartialEq, Eq, Serialize)]
 struct Scope {
     mode: ScopeMode,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Serialize)]
 enum ScopeMode {
     /// All packages except the excluded ones.
     DenyList(PackageSelection),
@@ -147,7 +149,7 @@ impl Default for ScopeMode {
 }
 
 #[non_exhaustive]
-#[derive(Default, Clone, Debug, PartialEq, Eq)]
+#[derive(Default, Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct PackageSelection {
     selection: ScopeSelection,
     excluded_packages: Vec<String>,
@@ -168,7 +170,7 @@ impl PackageSelection {
 }
 
 #[non_exhaustive]
-#[derive(Default, Debug, PartialEq, Eq, Clone)]
+#[derive(Default, Debug, PartialEq, Eq, Clone, Serialize)]
 pub enum ScopeSelection {
     /// All packages in the workspace. Equivalent to `--workspace`.
     Workspace,
@@ -257,6 +259,7 @@ impl Check {
             current_feature_config: rustdoc_gen::FeatureConfig::default_for_current(),
             baseline_feature_config: rustdoc_gen::FeatureConfig::default_for_baseline(),
             build_target: None,
+            witness_generation: WitnessGeneration::default(),
         }
     }
 
@@ -321,6 +324,12 @@ impl Check {
         self
     }
 
+    /// Set the options for generating witness code.  See [`WitnessGeneration`] for more.
+    pub fn set_witness_generation(&mut self, witness_generation: WitnessGeneration) -> &mut Self {
+        self.witness_generation = witness_generation;
+        self
+    }
+
     /// Some `RustdocSource`s don't contain a path to the project root,
     /// so they don't have a target directory. We try to deduce the target directory
     /// on a "best effort" basis -- when the source contains a target dir,
@@ -377,7 +386,9 @@ impl Check {
     }
 
     pub fn check_release(&self, config: &mut GlobalConfig) -> anyhow::Result<Report> {
-        let rustdoc_cmd = RustdocCommand::new().deps(false).silence(config.is_info());
+        let rustdoc_cmd = RustdocCommand::new()
+            .deps(false)
+            .silence(!config.is_verbose());
 
         // If both the current and baseline rustdoc are given explicitly as a file path,
         // we don't need to use the installed rustc, and this check can be skipped.
@@ -458,6 +469,7 @@ impl Check {
                             baseline_crate,
                             self.release_type,
                             &OverrideStack::new(),
+                            &self.witness_generation,
                         )?;
                         config.shell_status(
                             "Finished",
@@ -489,7 +501,7 @@ note: skipped the following crates since they have no library target: {skipped}"
                 let workspace_overrides =
                     manifest::deserialize_lint_table(&metadata.workspace_metadata)
                         .context("[workspace.metadata.cargo-semver-checks] table is invalid")?
-                        .map(|table| Arc::new(table.inner));
+                        .map(|table| table.into_stack());
 
                 selected
                     .iter()
@@ -532,12 +544,16 @@ note: skipped the following crates since they have no library target: {skipped}"
 
                             if lint_workspace_key || metadata_workspace_key {
                                 if let Some(workspace) = &workspace_overrides {
-                                    overrides.push(Arc::clone(workspace));
+                                    for level in workspace {
+                                        overrides.push(level);
+                                    }
                                 }
                             }
 
                             if let Some(package) = package_overrides {
-                                overrides.push(Arc::new(package.inner));
+                                for level in package.into_stack() {
+                                    overrides.push(&level);
+                                }
                             }
 
                             let start = std::time::Instant::now();
@@ -571,6 +587,7 @@ note: skipped the following crates since they have no library target: {skipped}"
                                     baseline_crate,
                                     self.release_type,
                                     &overrides,
+                                    &self.witness_generation
                                 )?),
                             ));
                             config.shell_status(
@@ -676,6 +693,33 @@ impl Report {
     /// Reports of each crate checked, sorted by crate name.
     pub fn crate_reports(&self) -> &BTreeMap<String, CrateReport> {
         &self.crate_reports
+    }
+}
+
+/// Options for generating **witness code**.  A witness is a minimal buildable
+/// example of how downstream code could break for a specific breaking change.
+///
+/// See also: [`Witness`]
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
+pub struct WitnessGeneration {
+    /// Whether to print witness hints, short examples that show why a change is breaking,
+    /// while not necessarily buildable standalone programs.  See [`Witness::hint_template`].
+    pub show_hints: bool,
+    /// Optional directory to write full witness examples to.  If this is `None`, full witnesses
+    /// will not be generated.  See [`Witness::witness_template`].
+    pub witness_directory: Option<PathBuf>,
+}
+
+impl WitnessGeneration {
+    /// Creates a new [`WitnessGeneration`] instance indicating to not generate any witnesses.
+    #[inline]
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            show_hints: false,
+            witness_directory: None,
+        }
     }
 }
 

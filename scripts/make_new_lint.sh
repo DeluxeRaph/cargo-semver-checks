@@ -52,6 +52,9 @@ SemverQuery(
     },
     error_message: "TODO",
     per_result_error_template: Some("TODO"),
+    // TODO: see https://github.com/obi1kenobi/cargo-semver-checks/blob/main/CONTRIBUTING.md#adding-a-witness
+    // for information about this field.
+    witness: None,
 )
 EOF
     echo ' done!'
@@ -62,12 +65,16 @@ NEW_LINT_TEST_CRATES_DIR="$TEST_CRATES_DIR/$NEW_LINT_NAME"
 ./scripts/make_new_test_crate.sh "$NEW_LINT_NAME"
 
 # Add the test outputs file.
-NEW_TEST_OUTPUT_FILE="$TEST_OUTPUTS_DIR/$NEW_LINT_NAME.output.ron"
+NEW_TEST_OUTPUT_FILE="$TEST_OUTPUTS_DIR/query_execution/$NEW_LINT_NAME.snap"
 echo -n "Creating test outputs file ${NEW_TEST_OUTPUT_FILE#"$TOPLEVEL/"} ..."
 if [[ -f "$NEW_TEST_OUTPUT_FILE" ]]; then
     echo ' already exists.'
 else
     cat <<EOF >"$NEW_TEST_OUTPUT_FILE"
+---
+source: src/query.rs
+expression: "&query_execution_results"
+---
 {
     "./test_crates/$NEW_LINT_NAME/": [
         // TODO

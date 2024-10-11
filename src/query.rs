@@ -1,5 +1,6 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::collections::BTreeMap;
 
+use ron::extensions::Extensions;
 use serde::{Deserialize, Serialize};
 use trustfall::TransparentValue;
 
@@ -122,19 +123,36 @@ pub struct SemverQuery {
     /// a human-readable description of the specific semver violation that was discovered.
     #[serde(default)]
     pub(crate) per_result_error_template: Option<String>,
+
+    /// Optional data to create witness code for query output.  See the [`Witness`] struct for
+    /// more information.
+    #[serde(default)]
+    pub witness: Option<Witness>,
 }
 
 impl SemverQuery {
+    /// Deserializes a [`SemverQuery`] from a [`ron`]-encoded string slice.
+    ///
+    /// Returns an `Err` if the deserialization fails.
+    pub fn from_ron_str(query_text: &str) -> ron::Result<Self> {
+        let mut deserializer = ron::Deserializer::from_str_with_options(
+            query_text,
+            ron::Options::default().with_default_extension(Extensions::IMPLICIT_SOME),
+        )?;
+
+        Self::deserialize(&mut deserializer)
+    }
+
     pub fn all_queries() -> BTreeMap<String, SemverQuery> {
         let mut queries = BTreeMap::default();
         for (id, query_text) in get_queries() {
-            let query: SemverQuery = ron::from_str(query_text).unwrap_or_else(|e| {
+            let query = Self::from_ron_str(query_text).unwrap_or_else(|e| {
                 panic!(
                     "\
-Failed to parse a query: {e}
-```ron
-{query_text}
-```"
+                Failed to parse a query: {e}
+                ```ron
+                {query_text}
+                ```"
                 );
             });
             assert_eq!(id, query.id, "Query id must match file name");
@@ -168,12 +186,14 @@ pub struct QueryOverride {
 /// A mapping of lint ids to configured values that override that lint's defaults.
 pub type OverrideMap = BTreeMap<String, QueryOverride>;
 
-/// Stores a stack of [`OverrideMap`] references such that items towards the top of
-/// the stack (later in the backing `Vec`) have *higher* precedence and override items lower in the stack.
-/// That is, when an override is set and not `None` for a given lint in multiple maps in the stack, the value
-/// at the top of the stack will be used to calculate the effective lint level or required version update.  
+/// A stack of [`OverrideMap`] values capturing our precedence rules.
+///
+/// Items toward the top of the stack (later in the backing `Vec`) have *higher* precedence
+/// and override items lower in the stack. If an override is set and not `None` for a given lint
+/// in multiple maps in the stack, the value at the top of the stack will be used
+/// to calculate the effective lint level or required version update.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct OverrideStack(Vec<Arc<OverrideMap>>);
+pub struct OverrideStack(Vec<OverrideMap>);
 
 impl OverrideStack {
     /// Creates a new, empty [`OverrideStack`] instance.
@@ -182,12 +202,12 @@ impl OverrideStack {
         Self(Vec::new())
     }
 
-    /// Inserts the given element at the top of the stack.
+    /// Inserts the given map at the top of the stack.
     ///
     /// The inserted overrides will take precedence over any lower item in the stack,
     /// if both maps have a not-`None` entry for a given lint.
-    pub fn push(&mut self, item: Arc<OverrideMap>) {
-        self.0.push(item);
+    pub fn push(&mut self, item: &OverrideMap) {
+        self.0.push(item.clone());
     }
 
     /// Calculates the *effective* lint level of this query, by searching for an override
@@ -215,25 +235,113 @@ impl OverrideStack {
     }
 }
 
-impl From<Vec<Arc<OverrideMap>>> for OverrideStack {
-    fn from(value: Vec<Arc<OverrideMap>>) -> Self {
-        Self(value)
-    }
+/// Data for generating a **witness** from the results of a [`SemverQuery`].
+///
+/// A witness is a minimal compilable example of how downstream code would
+/// break given this change.  See field documentation for more information
+/// on each member.
+///
+/// Fields besides [`hint_template`](Self::hint_template) are optional, as it is not
+/// always necessary to use an additional query [`witness_query`](Self::witness_query)
+/// or possible to build a compilable witness from [`witness_template`](Self::witness_template)
+/// for a given `SemverQuery`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Witness {
+    /// A [`handlebars`] template that renders a user-facing hint to give a quick
+    /// explanation of breakage.  This may not be a buildable example, but it should
+    /// show the idea of why downstream code could break.  It will be provided all
+    /// `@output` data from the [`SemverQuery`] query that contains this [`Witness`].
+    ///
+    /// Example for the `function_missing` lint, where `name` is the (re)moved function's
+    /// name and `path` is the importable path:
+    ///
+    /// ```no_run
+    /// # let _ = r#"
+    /// use {{join "::" path}};
+    /// {{name}}(...);
+    /// # "#;
+    /// ```
+    ///
+    /// Notice how this is not a compilable example, but it provides a distilled hint to the user
+    /// of how downstream code would break with this change.
+    pub hint_template: String,
+
+    /// A [`handlebars`] template that renders the compilable witness example of how
+    /// downstream code would break.
+    ///
+    /// This template will be provided any fields with `@output` directives in the
+    /// original [`SemverQuery`].  If [`witness_query`](Self::witness_query) is `Some`,
+    /// it will also be provided the `@output`s of that query. (The additional query's
+    /// outputs will take precedence over the original query if they share the same name.)
+    ///
+    /// Example for the `enum_variant_missing` lint, where `path` is the importable path of the enum,
+    /// `name` is the name of the enum, and `variant_name` is the name of the removed/renamed variant:
+    ///
+    /// ```no_run
+    /// # let _ = r#"
+    /// fn witness(item: {{path}}) {
+    ///     if let {{path}}::{{variant_name}} {..} = item {
+    ///
+    ///     }
+    /// }
+    /// # "#;
+    /// ```
+    #[serde(default)]
+    pub witness_template: Option<String>,
+
+    /// An optional query to collect more information that is necessary to render
+    /// the [`witness_template`](Self::witness_template).
+    ///
+    /// If `None`, no additional query will be run.
+    #[serde(default)]
+    pub witness_query: Option<WitnessQuery>,
+}
+
+/// A [`trustfall`] query, for [`Witness`] generation, containing the query
+/// string itself and a mapping of argument names to value types which are
+/// provided to the query.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WitnessQuery {
+    /// The string containing the Trustfall query.
+    pub query: String,
+
+    /// The mapping of argument names to values provided to the query.
+    ///
+    /// These can be inherited from a previous query ([`InheritedValue::Inherited`]) or
+    /// specified as [`InheritedValue::Constant`]s.
+    #[serde(default)]
+    pub arguments: BTreeMap<String, InheritedValue>,
+}
+
+/// Represents either a value inherited from a previous query, or a
+/// provided constant value.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged, deny_unknown_fields)]
+pub enum InheritedValue {
+    /// Inherit the value from the previous output whose name is the given `String`.
+    Inherited { inherit: String },
+    /// Provide the constant value specified here.
+    Constant(TransparentValue),
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, OnceLock};
+    use std::borrow::Cow;
+    use std::collections::BTreeSet;
+    use std::path::PathBuf;
+    use std::sync::OnceLock;
     use std::{collections::BTreeMap, path::Path};
 
     use anyhow::Context;
+    use serde::{Deserialize, Serialize};
     use trustfall::{FieldValue, TransparentValue};
     use trustfall_rustdoc::{
         load_rustdoc, VersionedCrate, VersionedIndexedCrate, VersionedRustdocAdapter,
     };
 
     use crate::query::{
-        LintLevel, OverrideStack, QueryOverride, RequiredSemverUpdate, SemverQuery,
+        InheritedValue, LintLevel, OverrideMap, OverrideStack, QueryOverride, RequiredSemverUpdate,
+        SemverQuery,
     };
     use crate::templating::make_handlebars_registry;
 
@@ -383,6 +491,27 @@ mod tests {
 
     type TestOutput = BTreeMap<String, Vec<BTreeMap<String, FieldValue>>>;
 
+    #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+    #[non_exhaustive]
+    struct WitnessOutput {
+        filename: String,
+        begin_line: usize,
+        hint: String,
+    }
+
+    impl PartialOrd for WitnessOutput {
+        fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+
+    /// Sorts by span (filename, begin_line)
+    impl Ord for WitnessOutput {
+        fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+            (&self.filename, self.begin_line).cmp(&(&other.filename, other.begin_line))
+        }
+    }
+
     fn pretty_format_output_difference(
         query_name: &str,
         output_name1: &'static str,
@@ -459,16 +588,9 @@ mod tests {
 
     pub(in crate::query) fn check_query_execution(query_name: &str) {
         let query_text = std::fs::read_to_string(format!("./src/lints/{query_name}.ron")).unwrap();
-        let semver_query: SemverQuery = ron::from_str(&query_text).unwrap();
+        let semver_query = SemverQuery::from_ron_str(&query_text).unwrap();
 
-        let expected_result_text =
-            std::fs::read_to_string(format!("./test_outputs/{query_name}.output.ron"))
-            .with_context(|| format!("Could not load test_outputs/{query_name}.output.ron expected-outputs file, did you forget to add it?"))
-            .expect("failed to load expected outputs");
-        let mut expected_results: TestOutput = ron::from_str(&expected_result_text)
-            .expect("could not parse expected outputs as ron format");
-
-        let mut actual_results: TestOutput = get_test_crate_names()
+        let mut query_execution_results: TestOutput = get_test_crate_names()
             .iter()
             .map(|crate_pair_name| {
                 let (crate_old, crate_new) = get_test_crate_rustdocs(crate_pair_name);
@@ -500,59 +622,107 @@ mod tests {
             .filter(|(_crate_pair_name, output)| !output.is_empty())
             .collect();
 
-        // Reorder both vectors of results into a deterministic order that will compensate for
+        // Reorder vector of results into a deterministic order that will compensate for
         // nondeterminism in how the results are ordered.
-        let sort_individual_outputs = |results: &mut TestOutput| {
-            let key_func = |elem: &BTreeMap<String, FieldValue>| {
-                let filename = elem.get("span_filename").and_then(|value| value.as_str());
-                let line = elem.get("span_begin_line");
+        let key_func = |elem: &BTreeMap<String, FieldValue>| {
+            let filename = elem.get("span_filename").and_then(|value| value.as_str());
+            let line = elem.get("span_begin_line");
 
-                match (filename, line) {
-                    (Some(filename), Some(line)) => (filename.to_owned(), line.as_usize()),
-                    (Some(_filename), _) => panic!("A valid query must output `span_filename`. See https://github.com/obi1kenobi/cargo-semver-checks/blob/main/CONTRIBUTING.md for details."),
-                    (_, Some(_line)) => panic!("A valid query must output `span_begin_line`. See https://github.com/obi1kenobi/cargo-semver-checks/blob/main/CONTRIBUTING.md for details."),
-                    _ => panic!("A valid query must output both `span_filename` and `span_begin_line`. See https://github.com/obi1kenobi/cargo-semver-checks/blob/main/CONTRIBUTING.md for details."),
-                }
-            };
-            for value in results.values_mut() {
-                value.sort_unstable_by_key(key_func);
+            match (filename, line) {
+                (Some(filename), Some(line)) => (filename.to_owned(), line.as_usize()),
+                (Some(_filename), None) => panic!("A valid query must output `span_filename`. See https://github.com/obi1kenobi/cargo-semver-checks/blob/main/CONTRIBUTING.md for details."),
+                (None, Some(_line)) => panic!("A valid query must output `span_begin_line`. See https://github.com/obi1kenobi/cargo-semver-checks/blob/main/CONTRIBUTING.md for details."),
+                (None, None) => panic!("A valid query must output both `span_filename` and `span_begin_line`. See https://github.com/obi1kenobi/cargo-semver-checks/blob/main/CONTRIBUTING.md for details."),
             }
         };
-        sort_individual_outputs(&mut expected_results);
-        sort_individual_outputs(&mut actual_results);
-
-        if expected_results != actual_results {
-            panic!(
-                "\n{}\n",
-                pretty_format_output_difference(
-                    query_name,
-                    "expected",
-                    expected_results,
-                    "actual",
-                    actual_results
-                )
-            );
+        for value in query_execution_results.values_mut() {
+            value.sort_unstable_by_key(key_func);
         }
+
+        insta::with_settings!(
+            {
+                prepend_module_to_snapshot => false,
+                snapshot_path => "../test_outputs/query_execution",
+            },
+            {
+                insta::assert_ron_snapshot!(query_name, &query_execution_results);
+            }
+        );
+
+        let transparent_results: BTreeMap<_, Vec<BTreeMap<_, TransparentValue>>> =
+            query_execution_results
+                .into_iter()
+                .map(|(k, v)| {
+                    (
+                        k,
+                        v.into_iter()
+                            .map(|x| x.into_iter().map(|(k, v)| (k, v.into())).collect())
+                            .collect(),
+                    )
+                })
+                .collect();
 
         let registry = make_handlebars_registry();
         if let Some(template) = semver_query.per_result_error_template {
-            assert!(!actual_results.is_empty());
+            assert!(!transparent_results.is_empty());
 
-            let flattened_actual_results: Vec<_> = actual_results
-                .into_iter()
+            let flattened_actual_results: Vec<_> = transparent_results
+                .iter()
                 .flat_map(|(_key, value)| value)
                 .collect();
             for semver_violation_result in flattened_actual_results {
-                let pretty_result: BTreeMap<String, TransparentValue> = semver_violation_result
-                    .into_iter()
-                    .map(|(k, v)| (k, v.into()))
-                    .collect();
-
                 registry
-                    .render_template(&template, &pretty_result)
+                    .render_template(&template, semver_violation_result)
                     .with_context(|| "Error instantiating semver query template.")
                     .expect("could not materialize template");
             }
+        }
+
+        if let Some(witness) = semver_query.witness {
+            let actual_witnesses: BTreeMap<_, BTreeSet<_>> = transparent_results
+                .iter()
+                .map(|(k, v)| {
+                    (
+                        Cow::Borrowed(k.as_str()),
+                        v.iter()
+                            .map(|values| {
+                                let Some(TransparentValue::String(filename)) = values.get("span_filename") else {
+                                    unreachable!("Missing span_filename String, this should be validated above")
+                                };
+                                let begin_line = match values.get("span_begin_line") {
+                                    Some(TransparentValue::Int64(i)) => *i as usize,
+                                    Some(TransparentValue::Uint64(n)) => *n as usize,
+                                    _ => unreachable!("Missing span_begin_line Int, this should be validated above"),
+                                };
+
+                                // TODO: Run witness queries and generate full witness here.
+                                WitnessOutput {
+                                    filename: filename.to_string(),
+                                    begin_line,
+                                    hint: registry
+                                        .render_template(&witness.hint_template, values)
+                                        .expect("error rendering hint template"),
+                                }
+                            })
+                            .collect(),
+                    )
+                })
+                .collect();
+
+            insta::with_settings!(
+                {
+                    prepend_module_to_snapshot => false,
+                    snapshot_path => "../test_outputs/witnesses",
+                    description => format!(
+                        "Lint `{query_name}` did not have the expected witness output.\n\
+                        See https://github.com/obi1kenobi/cargo-semver-checks/blob/main/CONTRIBUTING.md#testing-witnesses\n\
+                        for more information."
+                    ),
+                },
+                {
+                    insta::assert_toml_snapshot!(query_name, &actual_witnesses);
+                }
+            );
         }
     }
 
@@ -576,32 +746,29 @@ mod tests {
             arguments: BTreeMap::new(),
             error_message: String::new(),
             per_result_error_template: None,
+            witness: None,
         }
     }
 
     #[test]
     fn test_overrides() {
         let mut stack = OverrideStack::new();
-        stack.push(Arc::new(
-            [
-                (
-                    "query1".into(),
-                    QueryOverride {
-                        lint_level: Some(LintLevel::Allow),
-                        required_update: Some(RequiredSemverUpdate::Minor),
-                    },
-                ),
-                (
-                    "query2".into(),
-                    QueryOverride {
-                        lint_level: None,
-                        required_update: Some(RequiredSemverUpdate::Minor),
-                    },
-                ),
-            ]
-            .into_iter()
-            .collect(),
-        ));
+        stack.push(&OverrideMap::from_iter([
+            (
+                "query1".into(),
+                QueryOverride {
+                    lint_level: Some(LintLevel::Allow),
+                    required_update: Some(RequiredSemverUpdate::Minor),
+                },
+            ),
+            (
+                "query2".into(),
+                QueryOverride {
+                    lint_level: None,
+                    required_update: Some(RequiredSemverUpdate::Minor),
+                },
+            ),
+        ]));
 
         let q1 = make_blank_query(
             "query1".into(),
@@ -633,38 +800,30 @@ mod tests {
     #[test]
     fn test_override_precedence() {
         let mut stack = OverrideStack::new();
-        stack.push(Arc::new(
-            [
-                (
-                    "query1".into(),
-                    QueryOverride {
-                        lint_level: Some(LintLevel::Allow),
-                        required_update: Some(RequiredSemverUpdate::Minor),
-                    },
-                ),
-                (
-                    "query2".into(),
-                    QueryOverride {
-                        lint_level: None,
-                        required_update: Some(RequiredSemverUpdate::Minor),
-                    },
-                ),
-            ]
-            .into_iter()
-            .collect(),
-        ));
-
-        stack.push(Arc::new(
-            [(
+        stack.push(&OverrideMap::from_iter([
+            (
                 "query1".into(),
                 QueryOverride {
-                    required_update: None,
-                    lint_level: Some(LintLevel::Warn),
+                    lint_level: Some(LintLevel::Allow),
+                    required_update: Some(RequiredSemverUpdate::Minor),
                 },
-            )]
-            .into_iter()
-            .collect(),
-        ));
+            ),
+            (
+                ("query2".into()),
+                QueryOverride {
+                    lint_level: None,
+                    required_update: Some(RequiredSemverUpdate::Minor),
+                },
+            ),
+        ]));
+
+        stack.push(&OverrideMap::from_iter([(
+            "query1".into(),
+            QueryOverride {
+                required_update: None,
+                lint_level: Some(LintLevel::Warn),
+            },
+        )]));
 
         let q1 = make_blank_query(
             "query1".into(),
@@ -694,6 +853,114 @@ mod tests {
             RequiredSemverUpdate::Minor
         );
     }
+
+    /// Makes sure we can specify [`InheritedValue`]s with `Inherited(...)`
+    /// and untagged variants as [`TransparentValue`]s.
+    #[test]
+    fn test_inherited_value_deserialization() {
+        let my_map: BTreeMap<String, InheritedValue> = ron::from_str(
+            r#"{
+                "abc": (inherit: "abc"),
+                "string": "literal_string",
+                "int": -30,
+                "int_list": [-30, -2],
+                "string_list": ["abc", "123"],
+                }"#,
+        )
+        .expect("deserialization failed");
+
+        let Some(InheritedValue::Inherited { inherit: abc }) = my_map.get("abc") else {
+            panic!("Expected Inherited, got {:?}", my_map.get("abc"));
+        };
+
+        assert_eq!(abc, "abc");
+
+        let Some(InheritedValue::Constant(TransparentValue::String(string))) = my_map.get("string")
+        else {
+            panic!("Expected Constant(String), got {:?}", my_map.get("string"));
+        };
+
+        assert_eq!(&**string, "literal_string");
+
+        let Some(InheritedValue::Constant(TransparentValue::Int64(int))) = my_map.get("int") else {
+            panic!("Expected Constant(Int64), got {:?}", my_map.get("int"));
+        };
+
+        assert_eq!(*int, -30);
+
+        let Some(InheritedValue::Constant(TransparentValue::List(ints))) = my_map.get("int_list")
+        else {
+            panic!("Expected Constant(List), got {:?}", my_map.get("lint_list"));
+        };
+
+        let Some(TransparentValue::Int64(-30)) = ints.first() else {
+            panic!("Expected Int64(-30), got {:?}", ints.first());
+        };
+
+        let Some(TransparentValue::Int64(-2)) = ints.get(1) else {
+            panic!("Expected Int64(-30), got {:?}", ints.get(1));
+        };
+
+        let Some(InheritedValue::Constant(TransparentValue::List(strs))) =
+            my_map.get("string_list")
+        else {
+            panic!(
+                "Expected Constant(List), got {:?}",
+                my_map.get("string_list")
+            );
+        };
+
+        let Some(TransparentValue::String(s)) = strs.first() else {
+            panic!("Expected String, got {:?}", strs.first());
+        };
+
+        assert_eq!(&**s, "abc");
+
+        let Some(TransparentValue::String(s)) = strs.get(1) else {
+            panic!("Expected String, got {:?}", strs.get(1));
+        };
+
+        assert_eq!(&**s, "123");
+
+        ron::from_str::<InheritedValue>(r#"[(inherit: "invalid")]"#)
+            .expect_err("nested values should be TransparentValues, not InheritedValues");
+    }
+
+    pub(super) fn check_all_lint_files_are_used_in_add_lints(added_lints: &[&str]) {
+        let mut lints_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        lints_dir.push("src");
+        lints_dir.push("lints");
+
+        let expected_lints: BTreeSet<_> = added_lints.iter().copied().collect();
+        let mut missing_lints: BTreeSet<String> = Default::default();
+
+        let dir_contents =
+            fs_err::read_dir(lints_dir).expect("failed to read 'src/lints' directory");
+        for file in dir_contents {
+            let file = file.expect("failed to examine file");
+            let path = file.path();
+
+            // Check if we found a `*.ron` file. If so, that's a lint.
+            if path.extension().map(|x| x.to_string_lossy()) == Some(Cow::Borrowed("ron")) {
+                let stem = path
+                    .file_stem()
+                    .map(|x| x.to_string_lossy())
+                    .expect("failed to get file name as utf-8");
+
+                // Check if the lint was added using our `add_lints!()` macro.
+                // If not, that's an error.
+                if !expected_lints.contains(stem.as_ref()) {
+                    missing_lints.insert(stem.to_string());
+                }
+            }
+        }
+
+        assert!(
+            missing_lints.is_empty(),
+            "some lints in 'src/lints/' haven't been registered using the `add_lints!()` macro, \
+            so they won't be part of cargo-semver-checks: {missing_lints:?}"
+        )
+    }
 }
 
 macro_rules! add_lints {
@@ -706,6 +973,17 @@ macro_rules! add_lints {
                     super::tests::check_query_execution(stringify!($name))
                 }
             )*
+
+            #[test]
+            fn all_lint_files_are_used_in_add_lints() {
+                let added_lints = [
+                    $(
+                        stringify!($name),
+                    )*
+                ];
+
+                super::tests::check_all_lint_files_are_used_in_add_lints(&added_lints);
+            }
         }
 
         fn get_queries() -> Vec<(&'static str, &'static str)> {
@@ -735,6 +1013,7 @@ add_lints!(
     enum_marked_non_exhaustive,
     enum_missing,
     enum_must_use_added,
+    enum_no_repr_variant_discriminant_changed,
     enum_now_doc_hidden,
     enum_repr_int_changed,
     enum_repr_int_removed,
@@ -742,10 +1021,13 @@ add_lints!(
     enum_struct_variant_field_added,
     enum_struct_variant_field_missing,
     enum_struct_variant_field_now_doc_hidden,
+    enum_tuple_variant_changed_kind,
     enum_tuple_variant_field_added,
     enum_tuple_variant_field_missing,
     enum_tuple_variant_field_now_doc_hidden,
+    enum_unit_variant_changed_kind,
     enum_variant_added,
+    enum_variant_marked_non_exhaustive,
     enum_variant_missing,
     exported_function_changed_abi,
     function_abi_no_longer_unwind,
@@ -762,6 +1044,7 @@ add_lints!(
     inherent_method_const_removed,
     inherent_method_missing,
     inherent_method_must_use_added,
+    inherent_method_now_doc_hidden,
     inherent_method_unsafe_added,
     method_parameter_count_changed,
     module_missing,
@@ -782,14 +1065,24 @@ add_lints!(
     struct_pub_field_now_doc_hidden,
     struct_repr_transparent_removed,
     struct_with_pub_fields_changed_type,
+    struct_with_no_pub_fields_changed_type,
+    trait_added_supertrait,
+    trait_associated_const_added,
+    trait_associated_const_default_removed,
     trait_associated_const_now_doc_hidden,
+    trait_associated_type_added,
+    trait_associated_type_default_removed,
     trait_associated_type_now_doc_hidden,
+    trait_method_default_impl_removed,
+    trait_method_added,
     trait_method_missing,
     trait_method_now_doc_hidden,
     trait_method_unsafe_added,
     trait_method_unsafe_removed,
     trait_missing,
     trait_must_use_added,
+    trait_newly_sealed,
+    trait_no_longer_object_safe,
     trait_now_doc_hidden,
     trait_removed_associated_constant,
     trait_removed_associated_type,
@@ -800,7 +1093,8 @@ add_lints!(
     type_marked_deprecated,
     union_field_missing,
     union_missing,
+    union_must_use_added,
     union_now_doc_hidden,
+    union_pub_field_now_doc_hidden,
     unit_struct_changed_kind,
-    variant_marked_non_exhaustive,
 );
